@@ -1,9 +1,5 @@
-use std::{net::SocketAddr, os::unix::io::{AsRawFd, FromRawFd, RawFd}};
-use libc::timespec;
-use tokio::{io::unix::AsyncFd, net::UdpSocket};
-use libc::{iovec, mmsghdr, sa_family_t, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t};
+use std::{net::SocketAddr, os::unix::io::{AsRawFd, RawFd}};
 
-const MAX_DATAGRAMS : usize = 128;
 // Custom wrapper for the raw socket file descriptor
 pub struct CustomUdpSocket {
     fd: RawFd,
@@ -13,8 +9,8 @@ pub struct CustomUdpSocket {
 impl CustomUdpSocket {
     pub fn new(port: u16) -> std::io::Result<Self> {
         // Create UDP socket using libc
-        let rcvbuf_size = 104857600; // Example receive buffer size (32MB)
-        let sndbuf_size = 104857600; // Example send buffer size (64KB)
+        let rcvbuf_size = 104857600; // 100MB
+        let sndbuf_size = 104857600; // 100MB
         let fd = unsafe {
             libc::socket(
                 libc::AF_INET,
@@ -185,132 +181,6 @@ impl CustomUdpSocket {
         Ok(bytes_sent as usize)
     }
 
-    pub fn write_batch(
-        &self,
-        batch: &mut [(SocketAddr, Vec<u8>)],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-
-        // let mut msghdrs: [mmsghdr; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        // let mut iovs: [iovec; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        // let mut addrs: [sockaddr_in; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        // let mut addr_lens: [socklen_t; MAX_DATAGRAMS] = [std::mem::size_of::<sockaddr_in>() as socklen_t; MAX_DATAGRAMS];
-
-        let mut msghdrs: Vec<mmsghdr> = Vec::with_capacity(batch.len());
-        let mut iovs: Vec<iovec> = Vec::with_capacity(batch.len());
-        let mut addrs: Vec<sockaddr_storage> = Vec::with_capacity(batch.len());
-        let mut addr_lens: Vec<socklen_t> = Vec::with_capacity(batch.len());
-
-        for i in 0..batch.len() {
-            iovs.push(
-                iovec {
-                    iov_base: batch[i].1.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: batch[i].1.len(),
-                }
-            );
-
-            addrs.push(
-                match batch[i].0 {
-                    SocketAddr::V4(socket_addr_v4) => {
-                        let sockaddr = sockaddr_in {
-                            sin_family: libc::AF_INET as sa_family_t,
-                            sin_port: socket_addr_v4.port().to_be(),
-                            sin_addr: libc::in_addr {
-                                s_addr: u32::from(socket_addr_v4.ip().to_bits()).to_be(),
-                            },
-                            sin_zero: [0; 8],
-                        };
-                        unsafe { *(&sockaddr as *const sockaddr_in as *const sockaddr_storage) }
-                    },
-                    SocketAddr::V6(socket_addr_v6) => {
-                        let sockaddr = sockaddr_in6 {
-                            sin6_family: libc::AF_INET6 as sa_family_t,
-                            sin6_port: socket_addr_v6.port().to_be(),
-                            sin6_flowinfo: socket_addr_v6.flowinfo(),
-                            sin6_addr: libc::in6_addr {
-                                s6_addr: socket_addr_v6.ip().octets(),
-                            },
-                            sin6_scope_id: socket_addr_v6.scope_id(),
-                        };
-                        unsafe { *(&sockaddr as *const sockaddr_in6 as *const sockaddr_storage) }
-                    },
-                }
-            );
-
-            addr_lens.push(
-                match batch[i].0 {
-                    SocketAddr::V4(_) => {
-                        std::mem::size_of::<sockaddr_in>() as u32
-                    },
-                    SocketAddr::V6(_) => {
-                        std::mem::size_of::<sockaddr_in6>() as u32
-                    },
-                }
-            );
-
-            msghdrs.push(
-                mmsghdr {
-                    msg_hdr: libc::msghdr {
-                        msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
-                        msg_namelen: addr_lens[i],
-                        msg_iov: &mut iovs[i],
-                        msg_iovlen: 1,
-                        msg_control: std::ptr::null_mut(),
-                        msg_controllen: 0,
-                        msg_flags: 0,
-                    },
-                    msg_len: 0,
-                }
-            ); 
-        }
-
-        let result = unsafe { 
-            libc::sendmmsg(
-                self.as_raw_fd(), 
-                msghdrs.as_mut_ptr(), 
-                MAX_DATAGRAMS as u32, 
-                0) 
-        };
-
-        match result {
-            -1 => {
-                let err = std::io::Error::last_os_error();
-                return Err(err.into());
-            },
-            _ => Ok(())
-        }
-    }
-
-
-    pub fn read_batch(
-        &self,
-        msghdrs: &mut [mmsghdr; MAX_DATAGRAMS],
-    ) -> Result<usize, std::io::Error> {
-        let result = unsafe {
-            libc::recvmmsg(
-                self.as_raw_fd(),
-                msghdrs.as_mut_ptr(),
-                MAX_DATAGRAMS as u32,
-                libc::MSG_DONTWAIT, // No flags
-                std::ptr::null_mut(), // No timeout
-            )
-        };
-
-        if result < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(err);
-            // if err.kind() == std::io::ErrorKind::WouldBlock {
-            //     // No data available, continue
-            //     guard.clear_ready();
-            //     tokio::task::yield_now().await;
-            //     continue;
-            // } else {
-            //     eprintln!("recvmmsg error: {}", err);
-            //     break;
-            // }
-        }
-
-        Ok(result as usize)
-    }
 
 }
 

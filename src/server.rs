@@ -1,39 +1,55 @@
 use std::os::fd::AsRawFd;
 use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, SocketAddr}, path::Path, str::FromStr, sync::Arc, usize};
 
-
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
-use libc::{iovec, mmsghdr, sa_family_t, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t};
-use packet::ip;
+
+use libc::{iovec, mmsghdr, sockaddr_in, sockaddr_storage, socklen_t};
 use rand::{Rng};
 
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use tokio::io::unix::AsyncFd;
-use tokio::{io::{AsyncBufReadExt}, sync::{mpsc, Mutex}, time::Instant};
-use tun_rs::{AsyncDevice, DeviceBuilder, GROTable, IDEAL_BATCH_SIZE, PACKET_INFORMATION_LENGTH, VIRTIO_NET_HDR_LEN};
+use tokio::{io::{AsyncBufReadExt}, time::Instant};
+use flume::{bounded, Receiver, Sender};
+
+use tun_rs::{AsyncDevice, DeviceBuilder, ExpandBuffer, GROTable, IDEAL_BATCH_SIZE};
 
 use tokio::io::{BufReader};
-// use aes_gcm_siv::{
-//     aead::{AeadMut, KeyInit}, AeadCore, Aes256GcmSiv, Nonce // Or `Aes128Gcm`
-// };
 
 use x25519_dalek::PublicKey;
 use ed25519_dalek::{ed25519::signature::Signer, SigningKey};
 
 use tokio::fs::File;
-use crate::client::{self, VPNClient};
-use crate::socket_wrapper::CustomUdpSocket;
-use crate::{diffie_hellman::generate_keypair, key_management::load_signing_key, messages::{AuthData, CryptoSupported, DHKeyPacket, DHKeyResponsePacket, EncryptedMessage, PacketType, TunnelSettingsPkt}};
-use std::thread::available_parallelism;
+use crate::bufferpool::{BufferHandle, BytesPool};
+use crate::client::VPNClient;
+use crate::messages::constants::ENCRYPTED_PACKET_HEADER_SIZE;
+use crate::messages::{
+    traits::{Decryptable, Encryptable}, 
+    authdata::{AuthPacket, AuthPacketEncrypted}, 
+    handshake::HandshakePacket,
+    handshake_response::HandshakeResponsePacket,
+    tunnel_settings::TunnelSettingsPacket,
+    encrypted::{EncryptedPacket},
+    decrypted::{DecryptedPacket},
+    constants::{PKT_TYPE_HANDSHAKE, PKT_TYPE_AUTH, PKT_TYPE_ENCRYPTED_PKT}
+};
 
+use crate::socket_wrapper::CustomUdpSocket;
+use crate::{diffie_hellman::generate_keypair, key_management::load_signing_key};
+use std::thread::available_parallelism;
 
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 const MAX_DATAGRAMS : usize = 128;
 const USER_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 const USER_TIMEOUT_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
+const BUFFER_POOL_SIZE: usize = 4096;
+const BUFFER_POOL_BUFFER_SIZE: usize = 2048;
+
+const TUN_WRITE_MAX_BATCH_SIZE: usize = 32;
+
+const BATCH_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_micros(500);
 
 async fn read_credentials_file(filename: impl AsRef<Path>) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(filename).await?;
@@ -76,9 +92,10 @@ pub struct Server {
     tun_device: Arc<AsyncDevice>,
     credentials: HashMap<String, String>,
     udpsocket_fd: AsyncFd<CustomUdpSocket>,
-    available_ip_addresses: ArrayQueue<IpAddr>,
-    pub_to_priv_ip: DashMap<SocketAddr, IpAddr>,
-    priv_ip_to_client: DashMap<IpAddr, VPNClient>,
+    bufferpool: Arc<BytesPool>,
+    available_ip_addresses: ArrayQueue<Ipv4Addr>,
+    pub_to_priv_ip: DashMap<SocketAddr, Ipv4Addr>,
+    priv_ip_to_client: DashMap<Ipv4Addr, VPNClient>,
 }
 
 
@@ -125,9 +142,9 @@ impl Server {
         let tun_network =  tun_ip_addr & tun_netmask_addr;
         
         //generation ip pool
-        let available_ip_addresses = ArrayQueue::<IpAddr>::new(address_count as usize);
+        let available_ip_addresses = ArrayQueue::<Ipv4Addr>::new(address_count as usize);
         for i in 1..address_count {
-            let new_ip_addr = IpAddr::V4(Ipv4Addr::from_bits(tun_network.to_bits() + i));
+            let new_ip_addr = Ipv4Addr::from_bits(tun_network.to_bits() + i);
             if new_ip_addr != IpAddr::V4(tun_ip_addr) {
                     available_ip_addresses.push(new_ip_addr).unwrap();
             }
@@ -144,6 +161,7 @@ impl Server {
             tun_netmask: tun_netmask_addr,
             tun_device: tun_interface,
             udpsocket_fd: async_udp_socket_fd,
+            bufferpool: Arc::new(BytesPool::new(BUFFER_POOL_SIZE, BUFFER_POOL_BUFFER_SIZE)),
             available_ip_addresses,
             pub_to_priv_ip: DashMap::new(),
             priv_ip_to_client: DashMap::new()
@@ -155,103 +173,110 @@ impl Server {
     //TODO 
     fn sock_write_batch(
         self: &Arc<Self>,
-        batch: &mut [(SocketAddr, Vec<u8>)]
+        batch: &[(EncryptedPacket, SocketAddr)]
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
+        let mut msghdrs = [unsafe { std::mem::zeroed::<mmsghdr>() }; MAX_DATAGRAMS];
+        let mut iovs = [unsafe { std::mem::zeroed::<iovec>() }; MAX_DATAGRAMS];
+        let mut addrs = [unsafe { std::mem::zeroed::<sockaddr_storage>() }; MAX_DATAGRAMS];
+        let mut addr_lens = [0u32; MAX_DATAGRAMS];
+        
+        // let msghdrs_ptr = msghdrs.as_mut_ptr() as *mut mmsghdr;
+        // let iovs_ptr = iovs.as_mut_ptr() as *mut iovec;
+        // let addrs_ptr = addrs.as_mut_ptr() as *mut sockaddr_storage;
 
         // let mut msghdrs: [mmsghdr; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
         // let mut iovs: [iovec; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        // let mut addrs: [sockaddr_in; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        // let mut addr_lens: [socklen_t; MAX_DATAGRAMS] = [std::mem::size_of::<sockaddr_in>() as socklen_t; MAX_DATAGRAMS];
+        //let mut addr_lens: [socklen_t; MAX_DATAGRAMS] = [std::mem::size_of::<sockaddr_in>() as socklen_t; MAX_DATAGRAMS];
 
-        let mut msghdrs: Vec<mmsghdr> = Vec::with_capacity(batch.len());
-        let mut iovs: Vec<iovec> = Vec::with_capacity(batch.len());
-        let mut addrs: Vec<sockaddr_storage> = Vec::with_capacity(batch.len());
-        let mut addr_lens: Vec<socklen_t> = Vec::with_capacity(batch.len());
-
-        for i in 0..batch.len() {
-            iovs.push(
-                iovec {
-                    iov_base: batch[i].1.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: batch[i].1.len(),
+        for (i, (encrypted_handle, sockaddr)) in batch.iter().enumerate() {
+            iovs[i] = iovec {
+                iov_base: encrypted_handle.data().as_ptr() as *mut libc::c_void,
+                iov_len: encrypted_handle.data().len(),
+            };
+  
+            match sockaddr {
+                SocketAddr::V4(addr_v4) => {
+                    let sockaddr_in = libc::sockaddr_in {
+                        sin_family: libc::AF_INET as u16,
+                        sin_port: addr_v4.port().to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: u32::from_be_bytes(addr_v4.ip().octets()),
+                        },
+                        sin_zero: [0; 8],
+                    };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            &sockaddr_in as *const _ as *const u8,
+                            &mut addrs[i] as *mut _ as *mut u8,
+                            std::mem::size_of::<libc::sockaddr_in>()
+                        );
+                    }
+                    addr_lens[i] = std::mem::size_of::<libc::sockaddr_in>() as u32;
                 }
-            );
-
-            addrs.push(
-                match batch[i].0 {
-                    SocketAddr::V4(socket_addr_v4) => {
-                        let sockaddr = sockaddr_in {
-                            sin_family: libc::AF_INET as sa_family_t,
-                            sin_port: socket_addr_v4.port().to_be(),
-                            sin_addr: libc::in_addr {
-                                s_addr: u32::from(socket_addr_v4.ip().to_bits()).to_be(),
-                            },
-                            sin_zero: [0; 8],
-                        };
-                        unsafe { *(&sockaddr as *const sockaddr_in as *const sockaddr_storage) }
-                    },
-                    SocketAddr::V6(socket_addr_v6) => {
-                        let sockaddr = sockaddr_in6 {
-                            sin6_family: libc::AF_INET6 as sa_family_t,
-                            sin6_port: socket_addr_v6.port().to_be(),
-                            sin6_flowinfo: socket_addr_v6.flowinfo(),
-                            sin6_addr: libc::in6_addr {
-                                s6_addr: socket_addr_v6.ip().octets(),
-                            },
-                            sin6_scope_id: socket_addr_v6.scope_id(),
-                        };
-                        unsafe { *(&sockaddr as *const sockaddr_in6 as *const sockaddr_storage) }
-                    },
+                SocketAddr::V6(addr_v6) => {
+                    let sockaddr_in6 = libc::sockaddr_in6 {
+                        sin6_family: libc::AF_INET6 as u16,
+                        sin6_port: addr_v6.port().to_be(),
+                        sin6_flowinfo: addr_v6.flowinfo(),
+                        sin6_addr: libc::in6_addr {
+                            s6_addr: addr_v6.ip().octets(),
+                        },
+                        sin6_scope_id: addr_v6.scope_id(),
+                    };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            &sockaddr_in6 as *const _ as *const u8,
+                            &mut addrs[i] as *mut _ as *mut u8,
+                            std::mem::size_of::<libc::sockaddr_in6>()
+                        );
+                    }
+                    addr_lens[i] = std::mem::size_of::<libc::sockaddr_in6>() as u32;
                 }
-            );
+            }
+           
+            msghdrs[i] = libc::mmsghdr {
+                msg_hdr: libc::msghdr {
+                    msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
+                    msg_namelen: addr_lens[i],
+                    msg_iov: &mut iovs[i],
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                },
+                msg_len: 0,
+            };
 
-            addr_lens.push(
-                match batch[i].0 {
-                    SocketAddr::V4(_) => {
-                        std::mem::size_of::<sockaddr_in>() as u32
-                    },
-                    SocketAddr::V6(_) => {
-                        std::mem::size_of::<sockaddr_in6>() as u32
-                    },
-                }
-            );
-
-            msghdrs.push(
-                mmsghdr {
-                    msg_hdr: libc::msghdr {
-                        msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
-                        msg_namelen: addr_lens[i],
-                        msg_iov: &mut iovs[i],
-                        msg_iovlen: 1,
-                        msg_control: std::ptr::null_mut(),
-                        msg_controllen: 0,
-                        msg_flags: 0,
-                    },
-                    msg_len: 0,
-                }
-            ); 
         }
+
+        //let mut msghdrs_init = unsafe { msghdrs.assume_init() };
 
         let result = unsafe { 
             libc::sendmmsg(
                 self.udpsocket_fd.as_raw_fd(), 
                 msghdrs.as_mut_ptr(), 
-                MAX_DATAGRAMS as u32, 
-                0) 
+                batch.len() as u32, 
+                libc::MSG_DONTWAIT) 
         };
 
-        match result {
-            -1 => {
-                let err = std::io::Error::last_os_error();
-                return Err(err.into());
-            },
-            _ => Ok(())
+        if result as usize == batch.len() {
+            Ok(())
+        } else if result < 0 {
+            Err(std::io::Error::last_os_error().into())
+        } else {
+            // Частичная отправка
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Partial send: {}/{} packets", result, batch.len())
+            ).into())
         }
     }
 
     async fn sock_write(
         self: &Arc<Self>,
-        data: PacketType,
-        dst_addr: SocketAddr
+        data: &[u8],
+        dst_addr: &SocketAddr
     )  -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     {
         // while let Some((msg, addr)) = consumer.recv().await {
@@ -260,68 +285,208 @@ impl Server {
         // }
         // Ok(())
         //let guard = self.udpsocket_fd.writable().await?;
-        let bytes = bincode::encode_to_vec(data, bincode::config::standard())
-            .map_err(|e| {println!("{e}"); format!("{e}")})?;
 
-        self.udpsocket_fd.get_ref().send_to(&bytes, dst_addr)?;
+        self.udpsocket_fd.get_ref().send_to(&data, *dst_addr)?;
         Ok(())
     }
 
 
-    async fn tun_read_loop(
-        self: Arc<Self>
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    async fn tun_read_task(
+        self: Arc<Self>,
+        to_encryption_tx: Sender<DecryptedPacket>
+    )
     {
-        let mut original_buffer = vec![0; VIRTIO_NET_HDR_LEN + 65535];
-        let mut bufs = vec![vec![0u8; 1500]; IDEAL_BATCH_SIZE];
+        // let mut original_buffer = vec![0; VIRTIO_NET_HDR_LEN + 65535];
+        // let mut bufs = vec![vec![0u8; 1500]; IDEAL_BATCH_SIZE];
+        // let mut sizes = vec![0; IDEAL_BATCH_SIZE];
+
+        let mut original_buffer = [0u8; 65535 + 10];
+        // Используем буферы из пула
+        let mut decrypted_buffer_handles: Vec<DecryptedPacket> = Vec::with_capacity(IDEAL_BATCH_SIZE);
+        //let mut bufs: Vec<&mut [u8]> = Vec::with_capacity(32);
         let mut sizes = vec![0; IDEAL_BATCH_SIZE];
-
+        
+        // Заранее выделяем буферы из пула
+        
+        println!("tun_read_task started");
         loop {
-            match self.tun_device.recv_multiple(&mut original_buffer, &mut bufs, &mut sizes, 0).await {
-                Ok(read_count) => {
-                    let mut send_buffers: Vec<(SocketAddr, Vec<u8>)> = Vec::with_capacity(MAX_DATAGRAMS);
-                    let mut send_count = 0;
-
-                    for i in 0..read_count {
-                        let len = sizes[i];
-                        if len < 20 {
-                            continue;
-                        }
-
-                        
-                        if let Some((_, destination)) = get_packet_info(&bufs[i][..len]) {
-                            if let Some(client) = self.priv_ip_to_client.get(&destination) {
-                                let encrypted_msg = client.encrypt_packet(&bufs[i][..len])?;
-                                let encrypted_pkt = PacketType::EncryptedPkt(encrypted_msg);
-                                let bytes = bincode::encode_to_vec(encrypted_pkt, bincode::config::standard())
-                                    .map_err(|e| {eprintln!("{e}"); format!("{e}")})?;
-                                send_buffers.push((client.public_ip, bytes));
-                                // let mut test = vec![(client.public_ip, bytes)];
-                                // self.sock_write_batch(&mut test)?;
-                                send_count += 1;
-                                //self.sock_write(PacketType::EncryptedPkt(encrypted_pkt), client.public_ip).await?;
-                            }
-                        }
-                    }
+            decrypted_buffer_handles.clear();
+            for _ in 0..IDEAL_BATCH_SIZE {
+                if let Some(handle) = self.bufferpool.acquire() {
+                    //handle.buf_resize(handle.buf_capacity(), 0);
+                    let mut dec_buf_handle = DecryptedPacket::new(handle);
+                    dec_buf_handle.buf_resize(dec_buf_handle.buf_capacity(), 0);
                     
-                    if send_count > 0 {
-                        self.sock_write_batch(&mut send_buffers[..send_count])?;
+                    decrypted_buffer_handles.push(dec_buf_handle);
+                } else {
+                    break;
+                }
+            }
+
+            if decrypted_buffer_handles.is_empty() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                continue;
+            }
+
+            match self.tun_device.recv_multiple(&mut original_buffer, &mut decrypted_buffer_handles, &mut sizes, ENCRYPTED_PACKET_HEADER_SIZE).await {
+                Ok(read_count) => {
+                    if read_count == 0 {
+                        continue;
+                    }
+
+                    for (i, mut used_handle) in decrypted_buffer_handles.drain(0..read_count).enumerate() {
+                        let size_with_header = sizes[i] + ENCRYPTED_PACKET_HEADER_SIZE;
+                        
+                        used_handle.buf_resize(size_with_header, 0);
+                        if let Err(e) = to_encryption_tx.send_async(used_handle).await {
+                            eprintln!("Failed to send to encryption channel: {}", e);
+                            break;
+                            // Оставшиеся в buffer_handles буферы вернутся в пул через drop
+                        }
                     }
                 },
                 Err(e) => {
-                    eprintln!("{e}")
+                    eprintln!("{e}");
+                    break;
                 },
             }
         }
-        return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+        println!("tun read task finished...");
+    }
+
+    
+
+    async fn encryption_worker(
+        self: Arc<Self>,
+        to_encrypt_rx: Receiver<DecryptedPacket>,
+    ) {
+
+        let mut send_batch = Vec::with_capacity(IDEAL_BATCH_SIZE);
+        //let mut bufs: Vec<&mut BytesMut> = Vec::with_capacity(MAX_DATAGRAMS);
+        let mut packet_count = 0;
+
+        println!("encryption worker started");
+        loop {
+            tokio::select! {
+                // Получаем пакет из канала
+                item = to_encrypt_rx.recv_async() => {
+                    match item {
+                        Ok(decrypted_handle) => {
+                            let start = tokio::time::Instant::now();
+
+                            if let Some((_, destination)) = get_packet_info(&decrypted_handle.data()[ENCRYPTED_PACKET_HEADER_SIZE..]) {
+                                if let Some(client) = self.priv_ip_to_client.get(&destination) {
+                                    match decrypted_handle.encrypt(&client.cipher) {
+                                        Ok(enc) => {
+                                            send_batch.push((enc, client.public_ip));
+                                            packet_count += 1;
+                                        },
+                                        Err(e) => {
+                                            eprintln!("Encrypt failed: {}", e);
+                                            continue;
+                                        },
+                                    };
+                                    let encrypt_time = start.elapsed();
+                                    if encrypt_time > tokio::time::Duration::from_millis(1) {
+                                        eprintln!("Slow encryption: {:?}", encrypt_time);
+                                    }
+
+   
+                                    if packet_count >= MAX_DATAGRAMS {
+                                        if let Err(e) = self.sock_write_batch(
+                                            &mut send_batch[..packet_count]
+                                        ) {
+                                            eprintln!("Failed to send batch to sock: {}", e);
+                                            break;
+                                        }
+
+                                        packet_count = 0;
+                                        send_batch.clear();
+                                    }
+                                    //self.sock_write(PacketType::EncryptedPkt(encrypted_pkt), client.public_ip).await?;
+                                } else {
+                                    eprintln!("Failed to get client by destination address {}", destination);
+                                    continue;
+                                }
+                            } else {
+                                eprintln!("Failed to get destination address from packet");
+                                continue;
+                            }
+                        },
+                        Err(_) => {
+                            break;
+                        },
+                    }
+
+                }
+                // Таймаут для отправки частичного батча
+                _ = tokio::time::sleep(BATCH_TIMEOUT) => {
+                    if packet_count > 0 {
+
+                        
+                        for (buf, addr) in send_batch[..packet_count].iter() {
+                            if let Err(e) = self.sock_write(buf.data(), addr ).await {
+                                eprintln!("Failed to send batch to sock: {}", e);
+                                break;
+                            }
+                        }
+
+                        if let Err(e) = self.sock_write_batch(
+                            &mut send_batch[..packet_count]
+                        ) {
+                            eprintln!("Failed to send batch to sock: {}", e);
+                            break;
+                        }
+                        // for buf in &mut tun_send_bufs[0..packet_count] {
+                        //     buf.clear();
+                        // }
+                        packet_count = 0;
+                        send_batch.clear();
+                    }
+                }
+            }
+        }
+        println!("encryption worker stopped...");
     }
 
 
-    fn check_authdata(self : &Arc<Self>, authdata: AuthData) 
+    fn check_authdata(
+        self : &Arc<Self>, 
+        authdata_handle: &AuthPacket,
+        prev_client_nonce: &u128,
+        prev_server_nonce: &u128
+    ) 
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     {
-        if let Some(password_hash) = self.credentials.get(&authdata.username) {
-            if authdata.password == *password_hash {
+
+        let username_bytes = authdata_handle.get_username_bytes();
+        let username = match std::str::from_utf8(username_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(format!("Failed to transform username bytes to utf8: {e}").into());
+            }
+        };
+
+        let password_bytes = authdata_handle.get_password_bytes();
+
+        let password_hex = hex::encode(password_bytes);
+
+        let client_nonce: u128 = {
+            let bytes: [u8; 16] = authdata_handle.get_client_nonce_bytes().try_into().unwrap();
+            u128::from_be_bytes(bytes)
+        };
+
+        let server_nonce: u128 = {
+            let bytes: [u8; 16] = authdata_handle.get_server_nonce_bytes().try_into().unwrap();
+            u128::from_be_bytes(bytes)
+        };
+    
+        if client_nonce != *prev_client_nonce || server_nonce != *prev_server_nonce {
+            return Err("Nonces are invalid".into())
+        }
+
+        if let Some(password_hash) = self.credentials.get(username) {
+            if password_hex == *password_hash {
                 return Ok(())
             } else {
                 return Err("Wrong Credentials".into())
@@ -331,64 +496,79 @@ impl Server {
         }
     }
 
-    fn find_available_ip(self: &Arc<Self>) 
-    -> Result<IpAddr, Box<dyn std::error::Error + Send + Sync>>
+    fn get_available_ip(self: &Arc<Self>) 
+    -> Option<Ipv4Addr>
     {
         //let mut ip_pool_lock = self.available_ip_addresses.lock().await;
-        
-        if let Some(ip_to_assign) = self.available_ip_addresses.pop() {
-            return Ok(ip_to_assign)
-        } else {
-            eprintln!("No IP addresses available for new client");
-            return Err("No IP addresses available for new client".into());
-        };
+        self.available_ip_addresses.pop()
     }
 
-    async fn handle_handshake(self: &Arc<Self>, client_dhkey_pkt: &DHKeyPacket, src_addr: &SocketAddr) 
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
+
+
+    async fn handshake_worker(self: Arc<Self>, handshake_rx: Receiver::<(HandshakePacket, SocketAddr)>) 
     {
-        if let Some(_) = self.pub_to_priv_ip.get(src_addr) {
-            eprintln!("User {} is already connected", src_addr);
-            return Err(format!("User {} is already connected", src_addr).into());
-        }
+        let mut sized_key_array: [u8; 32] = [0u8; 32];
+        let mut client_nonce_array: [u8; 16] = [0u8; 16];
 
-        let sized_key_array: [u8; 32] = client_dhkey_pkt.pub_key.clone().try_into().unwrap();
-        let other_pubkey = PublicKey::from(sized_key_array);
-
-        let (secret, public) = generate_keypair();
-        let shared_key = secret.diffie_hellman(&other_pubkey);
-
-        let cipher = ChaCha20Poly1305::new(shared_key.as_bytes().into());
-
-
-        let server_nonce: u128 = rand::thread_rng().r#gen();
-        
-        let public_key = public.to_bytes().to_vec();
-        let signature = self.signing_key.sign(&public_key).to_vec();
-        let dh_key_pkt_response = PacketType::HandshakeResponse(
-            DHKeyResponsePacket { 
-                pub_key: public_key,
-                nonce: server_nonce,
-                signature: signature
+        println!("handshake_worker started");
+        while let Ok((handshake_handle, src_addr)) = handshake_rx.recv_async().await {
+            if let Some(_) = self.pub_to_priv_ip.get(&src_addr) {
+                eprintln!("User {} is already connected", src_addr);
+                continue;
             }
-        );
+            //Parse handshake buffer
+            sized_key_array.copy_from_slice(handshake_handle.get_key_bytes());
+            client_nonce_array.copy_from_slice(handshake_handle.get_client_nonce_bytes());
 
-        self.sock_write(dh_key_pkt_response, *src_addr).await?;
+            let client_nonce = u128::from_be_bytes(client_nonce_array);
 
-        let vpnclient = VPNClient {
-            client_nonce: client_dhkey_pkt.nonce,
-            server_nonce: server_nonce,
-            public_ip: *src_addr,
-            authorized: false,
-            cipher,
-            lastseen: Instant::now(),
-        };
+            //2. generate shared key and fill response buffer
+            let other_pubkey = PublicKey::from(sized_key_array);
+            let (secret, public) = generate_keypair();
+            let shared_key = secret.diffie_hellman(&other_pubkey);
 
-        //4. find available tunnel ip
-        if let Ok(assigned_ip) = self.find_available_ip() {
-            self.pub_to_priv_ip.insert(*src_addr, assigned_ip);
+
+            let cipher = ChaCha20Poly1305::new(shared_key.as_bytes().into());
+
+            let server_nonce: u128 = rand::thread_rng().r#gen();
+
+            let signature = self.signing_key.sign(&public.to_bytes());
+
+            let buffer_handle = handshake_handle.clear_release();
+            let handshake_resp_handle = HandshakeResponsePacket::new(
+                buffer_handle,
+                public, 
+                server_nonce,
+                signature
+            );
+
+            //3. find available tunnel ip
+            let assigned_ip = match self.get_available_ip() {
+                Some(ip) => ip,
+                None => {
+                    eprintln!("No IP addresses available for new client");
+                    continue;
+                }
+            };
+
+            let vpnclient = VPNClient {
+                client_nonce: client_nonce,
+                server_nonce: server_nonce,
+                public_ip: src_addr,
+                authorized: false,
+                cipher,
+                lastseen: Instant::now(),
+            };
+
+            //4. Send client handshake responce
+            if let Err(e) = self.sock_write(&handshake_resp_handle.data(), &src_addr).await {
+                eprintln!("Failed to send handshake responce to {}: {}", src_addr, e);
+                continue;
+            }
+
+            self.pub_to_priv_ip.insert(src_addr, assigned_ip);
             self.priv_ip_to_client.insert(assigned_ip, vpnclient);
-            
+
             println!("New client connected: {} -> {}", src_addr, assigned_ip);
 
             //remove client if he doesnt send auth data
@@ -412,192 +592,95 @@ impl Server {
             });
         }
 
+        println!("handshake worker stopped...");
         //self.priv_ip_tp_client.lock().await.insert(src_addr.ip(), vpnclient);
-        Ok(())
     }
 
 
-    async fn handle_auth_packet(self: &Arc<Self>, enc_auth_data: &EncryptedMessage, src_addr: &SocketAddr) 
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    async fn authentication_worker(self: Arc<Self>, authdata_rx: Receiver::<(AuthPacketEncrypted, SocketAddr)>)
     {
-        //If users sent handshake and it is still relevant
-        //let mut pub_to_priv_lock = self.pub_to_priv_ip.lock().await;
-
-        let private_ip_opt = self.pub_to_priv_ip.get(&src_addr);
-        if let None = private_ip_opt {
-            eprintln!("Error for user address {} : Auth data sent, but user is not present it active clients", src_addr);
-            return Err("Error for user address {} : Auth data sent, but user is not present it active clients".into());
-        }
-        let private_ip = private_ip_opt.unwrap();
-
-        
-        let client_opt = self.priv_ip_to_client.get_mut(&private_ip);
-        if let None = client_opt {
-            self.pub_to_priv_ip.remove(&src_addr);
-            eprintln!("Public ip {} is presend, but client does not exist", src_addr);
-            return Err("Public ip {} is presend, but client does not exist".into());
-        }
-        let mut client = client_opt.unwrap();
-
-        //Decrypt and check login and password
-        match AuthData::decrypt(enc_auth_data, &client.cipher) {
-            Ok(auth_data) => {
-                if auth_data.client_nonce != client.client_nonce || auth_data.server_nonce != client.server_nonce {
-                    return Err(format!("Possible replay attack from {src_addr}, client tries to authenticate with wrong nonces").into())
-                }
-                match self.check_authdata(auth_data) {
-                    Ok(_) => {
-                        let tun_set_pkt = PacketType::TunnelSettings(
-                            TunnelSettingsPkt {
-                                ip_string: private_ip.to_string(),
-                                netmask_string: self.tun_netmask.to_string(),
-                                gateway_string: self.tun_ip.to_string()
-                            }.encrypt(&client.cipher)?
-                        );
-                        
-
-                        self.sock_write(tun_set_pkt, *src_addr).await?;
-                        client.authorized = true;
-                        client.lastseen = Instant::now();
-
-                    },
-                    Err(e) => {
-                        if let Some((_, priv_to_client)) = self.pub_to_priv_ip.remove(&src_addr) {
-                            self.priv_ip_to_client.remove(&priv_to_client);
-                        }
-                        eprintln!("{e}")
-                    },
-                }
-
-            },
-            Err(e) => {
-                if let Some((_, priv_to_client)) = self.pub_to_priv_ip.remove(&src_addr) {
-                    self.priv_ip_to_client.remove(&priv_to_client);
-                }
-                eprintln!("{e}");
+        println!("authentication_worker started");
+        while let Ok((authdata_handle, src_addr)) = authdata_rx.recv_async().await {
+            let private_ip_opt = self.pub_to_priv_ip.get(&src_addr);
+            if let None = private_ip_opt {
+                eprintln!("Error for user address {} : Auth data sent, but user is not present it active clients", src_addr);
+                continue;
             }
-        };
-                
-        Ok(())
+            let private_ip = private_ip_opt.unwrap();
+
+            let client_opt = self.priv_ip_to_client.get_mut(&private_ip);
+            if let None = client_opt {
+                self.pub_to_priv_ip.remove(&src_addr);
+                eprintln!("Public ip {} is presend, but client does not exist", src_addr);
+                continue;
+            }
+            let mut client = client_opt.unwrap();
+            
+            let decrypted_auth_handle = match authdata_handle.decrypt(&client.cipher) {
+                Ok(dec) => dec,
+                Err(e) => {
+                    eprintln!("Failed to decrypt auth data: {e}");
+                    if let Some((_, priv_to_client)) = self.pub_to_priv_ip.remove(&src_addr) {
+                        self.priv_ip_to_client.remove(&priv_to_client);
+                    }
+                    continue;
+                },
+            };
+            match self.check_authdata(&decrypted_auth_handle, &client.client_nonce, &client.server_nonce) {
+                Ok(_) => {
+                    let buffer_handle = decrypted_auth_handle.clear_release();
+                    let tunnel_settings_handle = TunnelSettingsPacket::new(
+                        buffer_handle,
+                        private_ip.to_bits(),
+                        self.tun_netmask.to_bits(),
+                        self.tun_ip.to_bits()
+                    );
+
+                    let tunnel_settings_encrypted = match tunnel_settings_handle.encrypt(&client.cipher) {
+                        Ok(enc) => enc,
+                        Err(e) => {
+                            eprintln!("Failed to encrypt tunnel settings: {e}");
+                            continue;
+                        },
+                    };
+
+                    if self.sock_write(&tunnel_settings_encrypted.data(), &src_addr).await.is_err() {
+                        eprintln!("Failed to send tunnel settings to client: {}", src_addr);
+                        break;
+                    }
+                    client.authorized = true;
+                    client.lastseen = Instant::now();
+
+                },
+                Err(e) => {
+                    if let Some((_, priv_to_client)) = self.pub_to_priv_ip.remove(&src_addr) {
+                        self.priv_ip_to_client.remove(&priv_to_client);
+                    }
+                    eprintln!("{e}")
+                },
+            }
+        }
+        println!("authentication worker stopped...");
     }
 
-    fn decrypt_packet(self: &Arc<Self>, enc_msg: &EncryptedMessage, src_addr: &SocketAddr)
-    -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let pub_to_priv_opt = self.pub_to_priv_ip.get(&src_addr);
+
+    fn get_client_by_public_ip(self: &Arc<Self>, public_ip: &SocketAddr) -> Option<dashmap::mapref::one::RefMut<'_, Ipv4Addr, VPNClient>> {
+        let pub_to_priv_opt = self.pub_to_priv_ip.get(public_ip);
         if let None = pub_to_priv_opt {
-            return Err(format!("Client {} is not in active users", src_addr).into());
+            eprintln!("Client {} is not in active users", public_ip);
+            return None;
         }
         let pub_to_priv = pub_to_priv_opt.unwrap();
 
         let client_opt = self.priv_ip_to_client.get_mut(&pub_to_priv);
         if let None = client_opt {
-            return Err(format!("Client {} private address is not assigned", src_addr).into());
+            eprintln!("Client {} private address is not assigned", public_ip);
+            return None;
         }
-        let mut client = client_opt.unwrap();
-
-        match client.authorized {
-            true => {
-                let decrypted = client.decrypt_packet(enc_msg)?;
-                match ip::Packet::new(&decrypted) {
-                    Ok(_pkt) => {
-                        client.lastseen = Instant::now();
-                        return Ok(decrypted)
-                    }
-                    Err(e) => {
-                        return Err(Box::new(e));
-                    }
-                }
-            },
-            false => {
-                return Err(format!("User {} is not authorized", src_addr).into());
-            },
-        }
+        client_opt
     }
 
-    async fn handle_encrypted_packet(self: &Arc<Self>, enc_msg: &EncryptedMessage, src_addr: &SocketAddr)
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    {
-    
-        let decrypt_result = self.decrypt_packet(enc_msg, src_addr);
-        match decrypt_result {
-            Ok(decrypted) => {
-                let mut gro_table = GROTable::default();
-                let mut bufs = vec![vec![0u8; 1500]; 1]; 
-                bufs[0].resize(VIRTIO_NET_HDR_LEN, 0u8);
-                bufs[0].extend_from_slice(&decrypted);
-                self.tun_device.send_multiple(&mut gro_table,  &mut bufs, VIRTIO_NET_HDR_LEN).await?;
-                Ok(())
-            },
-            Err(e) => {
-                return Err(e);
-            },
-        }
-    }
 
-    async fn handle_packet(self: &Arc<Self>, pkt: &PacketType, src_addr: &SocketAddr) 
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    {
-        match pkt {
-            PacketType::Handshake(dhkey_packet) => {
-                self.handle_handshake(dhkey_packet, src_addr).await?;
-            },
-            PacketType::AuthPacket(enc_auth_data) => {
-                self.handle_auth_packet(enc_auth_data, src_addr).await?;
-            },
-            PacketType::EncryptedPkt(encrypted_message) => {
-                self.handle_encrypted_packet(encrypted_message, src_addr).await?;
-            },
-            _ => {
-                eprintln!("Unknown packet type from {}", src_addr);
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_packet_batch(self: &Arc<Self>, batch: Vec<(PacketType, SocketAddr)>, mut gro_table: &mut GROTable) 
-    -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    {
-        let mut send_bufs = Vec::with_capacity(IDEAL_BATCH_SIZE); //vec![vec![0u8; 1500 + VIRTIO_NET_HDR_LEN]; IDEAL_BATCH_SIZE];
-        
-        for (pkt_type, src_addr) in batch.iter() {
-            match pkt_type {
-                PacketType::Handshake(dhkey_packet) => {
-                    if let Err(e) = self.handle_handshake(dhkey_packet, src_addr).await {
-                        eprintln!("Handshake error {e}");
-                    }
-                },
-                PacketType::AuthPacket(enc_auth_data) => {
-                    if let Err(e) = self.handle_auth_packet(enc_auth_data, src_addr).await {
-                        eprintln!("Auth error {e}");
-                    }
-                },
-                PacketType::EncryptedPkt(encrypted_message) => {
-
-                    let decrypted_result = self.decrypt_packet(encrypted_message, src_addr);
-                    match decrypted_result {
-                        Ok(decrypted) => {
-                            let mut decrypted_with_header = Vec::with_capacity(VIRTIO_NET_HDR_LEN + decrypted.len());
-                            decrypted_with_header.resize( VIRTIO_NET_HDR_LEN, 0u8);
-                            decrypted_with_header.extend_from_slice(&decrypted);
-                                    
-                            send_bufs.push(decrypted_with_header);
-                        },
-                        Err(e) => {
-                            eprintln!("Decryption error {e}");
-                        },
-                    }
-
-                },
-                _ => {
-                    eprintln!("Unknown packet type from {}", src_addr);
-                }
-            }
-        }
-        if !send_bufs.is_empty() {
-            self.tun_device.send_multiple(&mut gro_table,  &mut send_bufs, VIRTIO_NET_HDR_LEN).await?;
-        }
-        Ok(())
-    }
 
     async fn user_cleaup_task(self: &Arc<Self>) {
         let mut interval = tokio::time::interval(USER_CLEANUP_INTERVAL);
@@ -605,7 +688,7 @@ impl Server {
             interval.tick().await;
 
             let now = Instant::now();
-            self.priv_ip_to_client.retain(|priv_ip, client| {
+            self.priv_ip_to_client.retain(|_priv_ip, client| {
                 if now - client.lastseen > USER_TIMEOUT_DURATION {
                     self.pub_to_priv_ip.remove(&client.public_ip);
                     println!("User {} disconnected", client.public_ip);
@@ -618,351 +701,365 @@ impl Server {
     }
 
 
-    fn process_single_packet(
+    async fn sock_read_task(
         self: &Arc<Self>,
-        packet: PacketType,
-        src_addr: SocketAddr
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        match packet {
-            PacketType::Handshake(dhkey_packet) => {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        self.handle_handshake(&dhkey_packet, &src_addr).await
-                    })
-                })?;
-                Ok(None)
-            },
-            PacketType::AuthPacket(enc_auth_data) => {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        self.handle_auth_packet(&enc_auth_data, &src_addr).await
-                    })
-                })?;
-                Ok(None)
-            },
-            PacketType::EncryptedPkt(encrypted_message) => {
-
-                let pub_to_priv_opt = self.pub_to_priv_ip.get(&src_addr);
-                if let None = pub_to_priv_opt {
-                    eprintln!("Client {} is not in active users", src_addr);
-                    return Err(format!("Client {} is not in active users", src_addr).into());
-                }
-                let pub_to_priv = pub_to_priv_opt.unwrap();
-
-                let client_opt = self.priv_ip_to_client.get_mut(&pub_to_priv);
-                if let None = client_opt {
-                    eprintln!("Client {} private address is not assigned", src_addr);
-                    return Err(format!("Client {} private address is not assigned", src_addr).into());
-                }
-                let mut client = client_opt.unwrap();
-
-                match client.authorized {
-                    true => {
-                        let decrypted = match client.decrypt_packet(&encrypted_message) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                eprintln!("Decryption error {e}");
-                                return Err(e);
-                            },
-                        };
-
-                        if decrypted.len() < VIRTIO_NET_HDR_LEN {
-                            return Err("Dectypted message shorter than VIRTIO_NET_HDR_LEN".into());
-                        }
-                        
-                        match ip::Packet::new(&decrypted) {
-                            Ok(_pkt) => {
-
-                                let mut decrypted_with_header = Vec::with_capacity(VIRTIO_NET_HDR_LEN + decrypted.len());
-                                decrypted_with_header.resize( VIRTIO_NET_HDR_LEN, 0u8);
-                                decrypted_with_header.extend_from_slice(&decrypted);
-                                
-                                //self.tun_write.lock().await.write_all(&decrypted).await?;
-                                client.lastseen = Instant::now();
-                                Ok(Some(decrypted_with_header))
-                            }
-                            Err(e) => {
-                                eprintln!("Packet error {e}");
-                                return Err(e.into());
-                            }
-                        }
-                    },
-                    false => {
-                        eprintln!("User {} is not authorized", src_addr);
-                        return Err(format!("User {} is not authorized", src_addr).into());
-                    },
-                }
-            },
-            _ => {
-                eprintln!("Unknown packet type from {}", src_addr);
-                return Err(format!("Unknown packet type from {}", src_addr).into());
-            }
-        }
-    }
-
-
-    fn sock_read_worker(
-        self: &Arc<Self>,
-        udp_socket: &CustomUdpSocket,
-        packet_tx: mpsc::Sender<(PacketType, SocketAddr)>
+        //udp_socket: &CustomUdpSocket,
+        handshake_tx: Sender<(HandshakePacket, SocketAddr)>,
+        authdata_tx: Sender<(AuthPacketEncrypted, SocketAddr)>,
+        decryption_tx: Sender<(EncryptedPacket, SocketAddr)>
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        //prepare recvmmsg
         let mut msghdrs: [mmsghdr; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
         let mut iovs: [iovec; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
         let mut addrs: [sockaddr_in; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
         let addr_lens: [socklen_t; MAX_DATAGRAMS] = [std::mem::size_of::<sockaddr_in>() as socklen_t; MAX_DATAGRAMS];
         
-        // Allocate buffers for received data
-        let mut bufs = vec![vec![0u8; 1500]; MAX_DATAGRAMS];
+        let mut buffer_handles: Vec<Option<BufferHandle>> = Vec::with_capacity(MAX_DATAGRAMS);
 
-        for i in 0..MAX_DATAGRAMS {
-            iovs[i] = iovec {
-                iov_base: bufs[i].as_mut_ptr() as *mut libc::c_void,
-                iov_len: 1500,
-            };
-
-            msghdrs[i] = mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
-                    msg_namelen: addr_lens[i],
-                    msg_iov: &mut iovs[i],
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
-            };
-        }
-
-        'outer: loop {
-            //let mut guard = self.udpsocket.readable().await?;
-            
-            let num_received = match udp_socket.read_batch(&mut msghdrs) {
-                Ok(num_received) => {
-                    num_received
-                },
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
-                    } else {
-                        eprintln!("recvmmsg error: {}", e);
-                        return Err(e.into())
-                    }
-                },
-            };
-
-            for i in 0..num_received {
-                let len = msghdrs[i].msg_len as usize;
-                if len > 0 {
-                    // Convert the source address to a SocketAddr
-                    let src_addr = unsafe {
-                        let sockaddr_in = &*(&addrs[i] as *const _ as *const libc::sockaddr_in);
-                        std::net::SocketAddrV4::new(
-                            std::net::Ipv4Addr::from(sockaddr_in.sin_addr.s_addr.to_ne_bytes()),
-                            u16::from_be(sockaddr_in.sin_port),
-                        )
-                    };
-                    let src_addr = SocketAddr::V4(src_addr);
-
-                    
-                    // Copy the received data
-                    // let mut data = vec![0u8; len];
-                    // data.copy_from_slice(&bufs[i][0..len]);
-
-                    let pkt: PacketType = match bincode::decode_from_slice(&bufs[i][..len], bincode::config::standard()){
-                        Ok(r) => r.0,
-                        Err(e) => {
-                            eprintln!("Failed to deserialize packet {e}");
-                            continue;
-                        }
-                    };
-                    
-                    // Send to processing channel
-                    let send_result = tokio::runtime::Handle::current()
-                        .block_on(packet_tx.send((pkt, src_addr)));
-                    if let Err(e) = send_result {
-                        eprintln!("Failed to send to processing channel: {}", e);
-                        break 'outer Err(e.into());
-                    }
-                    
-                    // if let Err(e) = packet_tx.send((pkt, src_addr)).await {
-                    //     eprintln!("Failed to send to processing channel: {}", e);
-                    //     break 'outer Err(e.into());
-                    // }
+        println!("sock_read_task started");
+        let task_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = 'task: loop {
+            // 1. Получаю буфферы
+            buffer_handles.clear();
+            for _ in 0..MAX_DATAGRAMS {
+                if let Some(handle) = self.bufferpool.acquire() {
+                    buffer_handles.push(Some(handle));
+                } else {
+                    break;
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            if buffer_handles.is_empty() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                continue;
+            }
+
+            // 2. Set up iovecs
+            for (i, handle_opt) in buffer_handles.iter_mut().enumerate() {
+                if let Some(handle) = handle_opt {
+                    let buf = handle.data_mut();
+
+                    let ptr = buf.as_mut_ptr() as *mut libc::c_void;
+                    let capacity = buf.capacity();
+
+                    iovs[i] = iovec { 
+                        iov_base: ptr, 
+                        iov_len: capacity 
+                    };
+
+                    msghdrs[i] = mmsghdr { 
+                        msg_hdr: libc::msghdr {
+                            msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
+                            msg_namelen: addr_lens[i],
+                            msg_iov: &mut iovs[i],
+                            msg_iovlen: 1,
+                            msg_control: std::ptr::null_mut(),
+                            msg_controllen: 0,
+                            msg_flags: 0,
+                        }, 
+                        msg_len: 0 
+                    }
+                }
+            }
+
+          
+            // 3 read packets
+            let num_recieved = unsafe {
+                let recieve_count = libc::recvmmsg(
+                    self.udpsocket_fd.as_raw_fd(),
+                    msghdrs.as_mut_ptr(),
+                    buffer_handles.len() as u32,
+                    libc::MSG_DONTWAIT,
+                    std::ptr::null_mut()
+                );
+
+                if recieve_count < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        0
+                    } else {
+                        eprintln!("recvmmsg error: {}", err);
+                        for handle_opt in buffer_handles.drain(..) {
+                            if let Some(handle) = handle_opt {
+                                drop(handle);
+                            }
+                        }
+                        continue;
+                    }
+                } else {
+                    recieve_count as usize
+                }
+            };
+
+            //4 Process packets
+            for i in 0..num_recieved {
+                let len = msghdrs[i].msg_len as usize;
+                if len == 0 {
+                    continue;
+                }
+
+                let mut handle = buffer_handles[i].take().unwrap();
+
+                unsafe {
+                    handle.set_len(len);
+                }
+
+                let src_addr = unsafe {
+                    let sockaddr_in = &*(&addrs[i] as *const _ as *const libc::sockaddr_in);
+                    std::net::SocketAddrV4::new(
+                        std::net::Ipv4Addr::from(sockaddr_in.sin_addr.s_addr.to_ne_bytes()),
+                        u16::from_be(sockaddr_in.sin_port),
+                    ).into()
+                };
+            
+                
+
+                match handle.data()[0] {
+                    PKT_TYPE_HANDSHAKE => {
+                        if HandshakePacket::is_valid_buffer_size(len) {
+                            let handshake_pkt = HandshakePacket::from_recieved(handle);
+                            if let Err(e) = handshake_tx.send_async((handshake_pkt, src_addr)).await {
+                                eprintln!("Failed to send to handshake channel: {}", e);
+                                break 'task Err(format!("Failed to send to handshake channel: {}", e).into())
+                            }
+                        }
+
+                    },
+                    PKT_TYPE_AUTH => {
+                        if AuthPacketEncrypted::is_valid_buffer_size(&handle) {
+                            let auth_pkt_enc = AuthPacketEncrypted::new(handle);
+                            if let Err(e) = authdata_tx.send_async((auth_pkt_enc, src_addr)).await {
+                                eprintln!("Failed to send to authdata channel: {}", e);
+                                break 'task Err(format!("Failed to send to authdata channel: {}", e).into())
+                            }
+                        }
+                    },
+                    PKT_TYPE_ENCRYPTED_PKT => {
+                        if EncryptedPacket::is_valid_buffer_size(&handle) {
+                            let encrypted_pkt = EncryptedPacket::new(handle);
+                            if let Err(e) = decryption_tx.send_async((encrypted_pkt, src_addr)).await {
+                                eprintln!("Failed to send to decryption channel: {}", e);
+                                break 'task Err(format!("Failed to send to decryption channel: {}", e).into())
+                            }
+                        }
+                    },
+                    _ => {
+                        eprintln!("Unknown packet type: {}", handle.data()[0]);
+                    }
+                }
+   
+            }
+
+            //return unused buffer to pool
+            for handle_opt in buffer_handles.drain(..) {
+                if let Some(handle) = handle_opt {
+                    drop(handle);
+                }
+            }
+
+            if num_recieved == 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        };
+        println!("sock_read_task finished");
+        task_result
+    }
+
+    async fn decryption_worker(
+        self: Arc<Self>, 
+        to_decrypt_rx: Receiver<(EncryptedPacket, SocketAddr)>
+    ) {
+        let mut gro_table = GROTable::default();
+        let mut tun_send_bufs = Vec::<DecryptedPacket>::with_capacity(TUN_WRITE_MAX_BATCH_SIZE);
+        let mut packet_count = 0;
+
+        //let (tx, mut rx_decrypted) = mpsc::channel::<(BufferHandle, SocketAddr)>(32);
+
+        loop {
+            tokio::select! {
+                // Получаем пакет из канала
+                item = to_decrypt_rx.recv_async() => {
+                    match item {
+                        Ok((encrypted_handle, src_addr)) => {
+                            let start = tokio::time::Instant::now();
+
+                            let mut client = match self.get_client_by_public_ip(&src_addr) {
+                                Some(client) => {
+                                    client
+                                },
+                                None => {
+                                    continue;
+                                }
+                            };
+                            
+                            let decrypted_handle = match client.authorized {
+                                true => {
+                                    match encrypted_handle.decrypt(&client.cipher) {
+                                        Ok(dec) => {
+                                            client.lastseen = Instant::now();
+                                            dec
+                                        },
+                                        Err(e) => {
+                                            eprintln!("Failed to encrypt packet: {e}");
+                                            continue;
+                                        },
+                                    }
+                                },
+                                false => {
+                                    eprintln!("user {} is not authorized", client.public_ip);
+                                    continue;
+                                },
+                            };
+                          
+                            let encrypt_time = start.elapsed();
+                                if encrypt_time > tokio::time::Duration::from_millis(1) {
+                                    eprintln!("Slow encryption: {:?}", encrypt_time);
+                                }
+                                
+                                tun_send_bufs.push(decrypted_handle);
+                                packet_count += 1;
+
+
+                                if packet_count >= TUN_WRITE_MAX_BATCH_SIZE {
+                                    if let Err(e) = self.tun_device.send_multiple(
+                                        &mut gro_table, 
+                                        &mut tun_send_bufs[0..packet_count], 
+                                        ENCRYPTED_PACKET_HEADER_SIZE
+                                    ).await {
+                                        eprintln!("Failed to send batch to tun: {}", e);
+                                    }
+                                    
+                                    tun_send_bufs.clear();
+                                    packet_count = 0;
+                                }
+                            },
+                        Err(_) => {
+                            break;
+                        },
+                    }
+
+                }
+                // Таймаут для отправки частичного батча
+                _ = tokio::time::sleep(BATCH_TIMEOUT) => {
+                    if packet_count > 0 {
+                        if let Err(e) = self.tun_device.send_multiple(
+                            &mut gro_table, 
+                            &mut tun_send_bufs[0..packet_count], 
+                            ENCRYPTED_PACKET_HEADER_SIZE
+                        ).await {
+                            eprintln!("Failed to send batch to tun: {}", e);
+                        }
+                        tun_send_bufs.clear();
+                        packet_count = 0;
+                    }
+                }
+            }
         }
+        println!("decryption worker stopped...");
     }
 
     pub async fn run(self : &Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         
+        let (decryption_tx, decryption_rx) = bounded(1024);
+        let (encryption_tx, encryption_rx) = bounded(1024);
+        let (handshake_tx, handshake_rx) = bounded(1024);
+        let (authdata_tx, authdata_rx) = bounded(1024);
+        // let (decryption_tx, decryption_rx) = tokio::sync::mpsc::channel(1024);
+        // let (encryption_tx, encryption_rx) = tokio::sync::mpsc::channel(1024);
+        // let (handshake_tx, handshake_rx) = tokio::sync::mpsc::channel(1024);
+        // let (authdata_tx, authdata_rx) = tokio::sync::mpsc::channel(1024);
+
+        let mut encryption_worker_count = available_parallelism().unwrap().get();
+        encryption_worker_count = std::cmp::max(encryption_worker_count - 2, 1);
+
+        for _ in 0..encryption_worker_count {
+            
+            tokio::spawn({
+                let me = self.clone();
+                let encryption_rx_clone = encryption_rx.clone();
+                async move {
+                    me.encryption_worker(encryption_rx_clone).await
+                }
+            });
+
+            tokio::spawn({
+                let decryption_rx_clone = decryption_rx.clone();
+                let me = Arc::clone(&self);
+                async move {
+                    me.decryption_worker(decryption_rx_clone).await
+                }
+            });
+        }
+
         tokio::spawn({
             let me = Arc::clone(&self);
             async move {
                 me.user_cleaup_task().await;
             }
         });
-        
+
         tokio::spawn({
             let me = self.clone();
+            let encryption_tx_clone = encryption_tx.clone();
             async move {
-                me.tun_read_loop().await
+                me.tun_read_task(encryption_tx_clone).await
             }
         });
 
-        let (packet_tx, mut packet_rx) = mpsc::channel::<(PacketType, SocketAddr)>(100000);
         tokio::spawn({
             let me = Arc::clone(&self);
             async move {
-                // while let Some((pkt, src_addr)) = packet_rx.recv().await {
-                //      if let Err(e) = me.handle_packet(&pkt, &src_addr).await {
-                //             eprintln!("{e}");
-                //     }
-                // }
-                let mut gro_table = GROTable::default();
-                loop {
-                    let mut packet_buffer: Vec<(PacketType, SocketAddr)> = Vec::with_capacity(IDEAL_BATCH_SIZE * 4);
-                    packet_rx.recv_many(&mut packet_buffer,IDEAL_BATCH_SIZE).await;
-
-                    if let Err(e) = me.handle_packet_batch(packet_buffer, &mut gro_table).await {
-                        eprintln!("Batch processing error {e}");
-                        break;
-                    }
-                    
-                }
+                me.handshake_worker(handshake_rx).await
             }
         });
 
-
-        //prepare recvmmsg
-        let mut msghdrs: [mmsghdr; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        let mut iovs: [iovec; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        let mut addrs: [sockaddr_in; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        let addr_lens: [socklen_t; MAX_DATAGRAMS] = [std::mem::size_of::<sockaddr_in>() as socklen_t; MAX_DATAGRAMS];
-        
-        // Allocate buffers for received data
-        let mut bufs = vec![vec![0u8; 1500]; MAX_DATAGRAMS];
-
-        for i in 0..MAX_DATAGRAMS {
-            iovs[i] = iovec {
-                iov_base: bufs[i].as_mut_ptr() as *mut libc::c_void,
-                iov_len: 1500,
-            };
-
-            msghdrs[i] = mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
-                    msg_namelen: addr_lens[i],
-                    msg_iov: &mut iovs[i],
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
-                msg_len: 0,
-            };
-        }
-
+        tokio::spawn({
+            let me = Arc::clone(&self);
+            async move {
+                me.authentication_worker(authdata_rx).await
+            }
+        });
 
         println!("Listening...");
-        //let mut udp_buffer = vec![0u8; 65536];
-        'outer: loop {
-            let mut guard = self.udpsocket_fd.readable().await?;
 
-            let result = unsafe {
-                libc::recvmmsg(
-                    guard.get_inner().as_raw_fd(),
-                    msghdrs.as_mut_ptr(),
-                    MAX_DATAGRAMS as u32,
-                    libc::MSG_DONTWAIT, // No flags
-                    std::ptr::null_mut(), // No timeout
-                )
-            };
-
-            if result < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    // No data available, continue
-                    guard.clear_ready();
-                    tokio::task::yield_now().await;
-                    continue;
-                } else {
-                    eprintln!("recvmmsg error: {}", err);
-                    break;
-                }
-            }
-            let num_received = result as usize;
-
-
-            for i in 0..num_received {
-                let len = msghdrs[i].msg_len as usize;
-                if len > 0 {
-                    // Convert the source address to a SocketAddr
-                    let src_addr = unsafe {
-                        let sockaddr_in = &*(&addrs[i] as *const _ as *const libc::sockaddr_in);
-                        std::net::SocketAddrV4::new(
-                            std::net::Ipv4Addr::from(sockaddr_in.sin_addr.s_addr.to_ne_bytes()),
-                            u16::from_be(sockaddr_in.sin_port),
-                        )
-                    };
-                    let src_addr = SocketAddr::V4(src_addr);
-
-                    
-                    // Copy the received data
-                    // let mut data = vec![0u8; len];
-                    // data.copy_from_slice(&bufs[i][0..len]);
-
-                    let pkt: PacketType = match bincode::decode_from_slice(&bufs[i][..len], bincode::config::standard()){
-                        Ok(r) => r.0,
-                        Err(e) => {
-                            eprintln!("Failed to deserialize packet {e}");
-                            continue;
-                        }
-                    };
-                    
-                    // Send to processing channel
-                    if let Err(e) = packet_tx.send((pkt, src_addr)).await {
-                        eprintln!("Failed to send to processing channel: {}", e);
-                        break 'outer;
-                    }
-                }
-            }
-            guard.clear_ready();
-            tokio::task::yield_now().await
-        }
+        let handshake_tx_clone = handshake_tx.clone();
+        let authdata_tx_clone = authdata_tx.clone();
+        let decryption_tx_clone = decryption_tx.clone();
         
+        let _ = self.sock_read_task(
+            handshake_tx_clone,
+            authdata_tx_clone,
+            decryption_tx_clone
+        ).await;
+
+        println!("Exiting..");
         Ok(())
     }
         
 }
 
 
- fn get_packet_info(data: &[u8]) -> Option<(usize, IpAddr)> {
-        let pkt_version = data[0] >> 4;
+ fn get_packet_info(data: &[u8]) -> Option<(usize, Ipv4Addr)> {
+    let pkt_version = data[0] >> 4;
 
-        match pkt_version {
-            4 => {
-                let total_length = u16::from_be_bytes([data[2], data[3]]) as usize;
+    match pkt_version {
+        4 => {
+            let total_length = u16::from_be_bytes([data[2], data[3]]) as usize;
 
-                let dest_addr = std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]);
-                let dest_addr = IpAddr::V4(dest_addr);
-                Some((total_length, dest_addr))
-            },
-            6 => {
-                let payload_length = u16::from_be_bytes([data[4], data[5]]) as usize;
+            let dest_addr = std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]);
+            //let dest_addr = IpAddr::V4(dest_addr);
+            
+            Some((total_length, dest_addr))
+        },
+        // 6 => {
+        //     let payload_length = u16::from_be_bytes([data[4], data[5]]) as usize;
 
-                let total_length = 40 + payload_length;
+        //     let total_length = 40 + payload_length;
 
-                let mut dest_addr_bytes = [0u8; 16];
-                dest_addr_bytes.copy_from_slice(&data[24..40]);
-                let dest_addr = std::net::Ipv6Addr::from(dest_addr_bytes);
-                let dest_addr = IpAddr::V6(dest_addr);
-                Some((total_length, dest_addr))
-            },
-            _ => None
-        }
+        //     let mut dest_addr_bytes = [0u8; 16];
+        //     dest_addr_bytes.copy_from_slice(&data[24..40]);
+        //     let dest_addr = std::net::Ipv6Addr::from(dest_addr_bytes);
+        //     let dest_addr = IpAddr::V6(dest_addr);
+        //     Some((total_length, dest_addr))
+        // },
+        _ => None
     }
+}
