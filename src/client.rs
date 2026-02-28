@@ -1,20 +1,34 @@
 use std::{net::SocketAddr};
 use chacha20poly1305::ChaCha20Poly1305;
-use tokio::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 
 pub struct VPNClient {
     pub client_nonce: u128,
     pub server_nonce: u128,
     pub public_ip: SocketAddr,
-    pub authorized: bool,
+    pub authorized: AtomicBool,
     pub cipher: ChaCha20Poly1305,
-    pub lastseen: Instant
+    pub lastseen: AtomicU64
     // Other client-specific data
 }
 
 
 impl VPNClient {
+    pub fn new(client_nonce: u128, server_nonce: u128, public_ip: SocketAddr, cipher: ChaCha20Poly1305) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        Self { client_nonce, server_nonce, public_ip, authorized: AtomicBool::new(false), cipher, lastseen: AtomicU64::new(now) }
+    }
+
+    pub fn update_lastseen(&self) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.lastseen.store(now, Ordering::Relaxed);
+    }
+
+    pub fn set_authorized(&self, val: bool) {
+        self.authorized.store(val, Ordering::Relaxed);
+    }
     // pub fn form_encrypted_buffer_for_socket(self: &Self, buffer_handle: &mut BufferHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //     // let mut tun_pkt_nonce_slice = buffer_handle.data_mut().split_off(1);
     //     // let mut tun_pkt_plaintext_slice = tun_pkt_nonce_slice.split_off(12);

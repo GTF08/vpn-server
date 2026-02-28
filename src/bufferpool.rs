@@ -1,75 +1,58 @@
 use bytes::BytesMut;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+use crossbeam_queue::ArrayQueue;
 
+#[derive(Clone)]
 pub struct BytesPool {
-    buffers: Mutex<Vec<BytesMut>>,    // Защищённый Mutex
-    free_list: Mutex<Vec<usize>>,     // Отдельный Mutex
+    buffers: Arc<ArrayQueue<BytesMut>>
 }
 
 impl BytesPool {
     pub fn new(count: usize, buffer_size: usize) -> Self {
-        let buffers = (0..count)
-            .map(|_| BytesMut::with_capacity(buffer_size))
-            .collect();
+        let buffers = ArrayQueue::new(count);
+        for i in 0..count {
+            buffers.push(BytesMut::with_capacity(buffer_size)).unwrap();
+        }
+        let buffers = Arc::new(buffers);
         
-        let buffers = Mutex::new(buffers);
-        let free_list = Mutex::new((0..count).collect());
-        
-        Self { buffers, free_list}
+        Self { buffers}
     }
     
-    pub fn acquire(self: &Arc<Self>) -> Option<BufferHandle> {
+    pub fn acquire(&self) -> Option<BufferHandle> {
         // 1. Берём свободный индекс
-        let idx = {
-            let mut free = self.free_list.lock().unwrap();
-            free.pop()?
-        };
+        // let idx = {
+        //     let mut free = self.free_list.lock().await;
+        //     free.pop()?
+        // };
         
-        // 2. Забираем буфер
-        let buf = {
-            let mut buffers = self.buffers.lock().unwrap();
-            std::mem::take(&mut buffers[idx])
-        };
+        // // 2. Забираем буфер
+        // let buf = {
+        //     let mut buffers = self.buffers.lock().await;
+        //     std::mem::take(&mut buffers[idx])
+        // };
         
-        Some(BufferHandle::new(Arc::clone(self), idx, buf))
+        // Some(BufferHandle::new(Arc::clone(self), idx, buf))
+        let buf = self.buffers.pop()?;
+        Some(BufferHandle::new(self.buffers.clone(), buf))
     }
     
-    fn release(&self, idx: usize, mut buf: BytesMut) {
+    fn release(&self, mut buf: BytesMut) {
         // Очищаем буфер
         buf.clear();
         
-        // Возвращаем в пул
-        {
-            let mut buffers = self.buffers.lock().unwrap();
-            buffers[idx] = buf;
-        }
-        
-        // Помечаем как свободный
-        {
-            let mut free = self.free_list.lock().unwrap();
-            free.push(idx);
-        }
+        self.buffers.push(buf).unwrap();
     }
 }
 
-// RAII Handle
-
-// pub trait ExpandBuffer: AsRef<[u8]> + AsMut<[u8]> {
-//     fn buf_capacity(&self) -> usize;
-//     fn buf_resize(&mut self, new_len: usize, value: u8);
-//     fn buf_extend_from_slice(&mut self, src: &[u8]);
-// }
-
 
 pub struct BufferHandle {
-    pool: Arc<BytesPool>,
-    idx: usize,
+    queue: Arc<ArrayQueue<BytesMut>>,
     buf: BytesMut,
 }
 
 impl BufferHandle {
-    pub fn new(pool: Arc<BytesPool>, idx: usize, buf: BytesMut) -> Self {
-        Self { pool, idx, buf }
+    fn new(queue: Arc<ArrayQueue<BytesMut>>, buf: BytesMut) -> Self {
+        Self { queue, buf }
     }
 
     pub fn data(&self) -> &BytesMut {
@@ -87,84 +70,9 @@ impl BufferHandle {
     }
 }
 
-// impl Index<usize> for BufferHandle {
-//     type Output = u8; // The type returned by the index operation
-
-//     fn index(&self, index: usize) -> &Self::Output {
-//         &self.data()[index] // Delegate to the underlying Vec's index implementation
-//     }
-// }
-
-// impl IndexMut<usize> for BufferHandle {
-//     // The method to get a mutable reference to the element
-//     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-//         &mut self.data_mut()[index] // Delegate to Vec's index_mut implementation
-//     }
-// }
-
-// impl Index<Range<usize>> for BufferHandle {
-//     type Output = [u8]; // The type returned by the index operation
-
-//     fn index(&self, index: Range<usize>) -> &Self::Output {
-//         &self.data()[index] // Delegate to the underlying Vec's index implementation
-//     }
-// }
-
-// impl IndexMut<Range<usize>> for BufferHandle {
-//     // The method to get a mutable reference to the element
-//     fn index_mut(&mut self, index: Range<usize>) -> &mut Self::Output {
-//         &mut self.data_mut()[index] // Delegate to Vec's index_mut implementation
-//     }
-// }
-
-// impl Index<RangeFrom<usize>> for BufferHandle {
-//     type Output = [u8]; // The type returned by the index operation
-
-//     fn index(&self, index: RangeFrom<usize>) -> &Self::Output {
-//         &self.data()[index] // Delegate to the underlying Vec's index implementation
-//     }
-// }
-
-// impl IndexMut<RangeFrom<usize>> for BufferHandle {
-//     // The method to get a mutable reference to the element
-//     fn index_mut(&mut self, index: RangeFrom<usize>) -> &mut Self::Output {
-//         &mut self.data_mut()[index] // Delegate to Vec's index_mut implementation
-//     }
-// }
-
-// impl Index<RangeTo<usize>> for BufferHandle {
-//     type Output = [u8]; // The type returned by the index operation
-
-//     fn index(&self, index: RangeTo<usize>) -> &Self::Output {
-//         &self.data()[index] // Delegate to the underlying Vec's index implementation
-//     }
-// }
-
-// impl IndexMut<RangeTo<usize>> for BufferHandle {
-//     // The method to get a mutable reference to the element
-//     fn index_mut(&mut self, index: RangeTo<usize>) -> &mut Self::Output {
-//         &mut self.data_mut()[index] // Delegate to Vec's index_mut implementation
-//     }
-// }
-
-
-// // Реализуем AsMut<[u8]> для BufferHandle
-// impl std::convert::AsMut<[u8]> for BufferHandle {
-//     fn as_mut(&mut self) -> &mut [u8] {
-//         self.buf.as_mut()
-//     }
-// }
-
-// // Реализуем AsRef<[u8]> для BufferHandle
-// impl std::convert::AsRef<[u8]> for BufferHandle {
-//     fn as_ref(&self) -> &[u8] {
-//         self.buf.as_ref()
-//     }
-// }
-
 impl Drop for BufferHandle {
     fn drop(&mut self) {
         let buf = std::mem::take(&mut self.buf);
-        self.pool.release(self.idx, buf);
+        self.queue.push(buf).unwrap();
     }
 }

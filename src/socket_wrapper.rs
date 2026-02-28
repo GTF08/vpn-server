@@ -1,10 +1,16 @@
 use std::{net::SocketAddr, os::unix::io::{AsRawFd, RawFd}};
 
+const MAX_DATAGRAMS : usize = 128;
 // Custom wrapper for the raw socket file descriptor
 pub struct CustomUdpSocket {
     fd: RawFd,
+    //msghdrs: Box<[libc::mmsghdr; MAX_DATAGRAMS]>
 }
 
+// struct MmsgHdrWrapper(libc::mmsghdr);
+
+// unsafe impl Sync for CustomUdpSocket {}
+// unsafe impl Send for CustomUdpSocket {}
 
 impl CustomUdpSocket {
     pub fn new(port: u16) -> std::io::Result<Self> {

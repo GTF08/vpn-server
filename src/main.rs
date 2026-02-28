@@ -21,11 +21,21 @@ mod bufferpool;
 
 //curl ifconfig.me  # Should show your server's IP
 //nslookup myip.opendns.com resolver1.opendns.com  # Should show your server's IP
-
+use pprof::ProfilerGuard;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+
+    std::thread::spawn(|| {
+        let guard = ProfilerGuard::new(100).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(80));
+        if let Ok(report) = guard.report().build() {
+            let mut file = std::fs::File::create("flamegraph.svg").unwrap();
+            report.flamegraph(&mut file).unwrap();
+            println!("Flamegraph saved");
+        }
+    });
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -72,6 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                 process::exit(1);
         }
     }
+
+    
 
     return Ok(());
 }

@@ -7,7 +7,8 @@ edition = "2024"
 opt-level = 3
 codegen-units = 1
 lto = "fat"
-debug = false
+strip = false
+debug = 2
 panic = "abort"
 
 [dependencies]
@@ -16,6 +17,7 @@ aead = { version = "0.5.2", features = ["bytes"] }
 crossbeam-queue = "0.3.12"
 
 dashmap = "6.1.0"
+papaya = "0.2.3"
 
 chacha20poly1305 = "0.10.1"
 
@@ -33,3 +35,6 @@ log = "0.4"
 rand = "0.8"
 hex = "0.4.3"
 flume = "0.12.0"
+
+pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"] }
+ctrlc = "3.4"   # для обработки Ctrl+C

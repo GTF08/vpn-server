@@ -1,12 +1,16 @@
-use crate::{bufferpool::BufferHandle, messages::{constants::{CHACHA_ENCRYPTION_OVERHEAD_SIZE, PKT_AUTH_CLIENT_NONCE_SIZE, PKT_AUTH_NO_USERNAME_SIZE, PKT_AUTH_PASSWORD_HASH_SIZE, PKT_AUTH_SERVER_NONCE_SIZE, PKT_AUTH_USERNAME_LEN_RANGE, PKT_AUTH_USERNAME_START, PKT_TYPE_AUTH}, traits::{Decryptable, Encryptable}}};
+use crate::{
+    bufferpool::BufferHandle, 
+    messages::{constants::{CHACHA_ENCRYPTION_OVERHEAD_SIZE, PKT_AUTH_CLIENT_NONCE_SIZE, PKT_AUTH_NO_USERNAME_SIZE, PKT_AUTH_PASSWORD_HASH_SIZE, PKT_AUTH_SERVER_NONCE_SIZE, PKT_AUTH_USERNAME_LEN_RANGE, PKT_AUTH_USERNAME_START, PKT_TYPE_AUTH}, 
+    traits::{Decryptable, Encryptable}}
+};
 
 
 
-pub struct AuthPacket{
+pub struct AuthPacket {
     buffer_handle: BufferHandle
 }
 
-impl AuthPacket {
+impl AuthPacket  {
     pub fn new(
         mut buffer: BufferHandle,
         username: &[u8], 

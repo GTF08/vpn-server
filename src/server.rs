@@ -1,4 +1,5 @@
 use std::os::fd::AsRawFd;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, SocketAddr}, path::Path, str::FromStr, sync::Arc, usize};
 
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
@@ -42,12 +43,13 @@ use std::thread::available_parallelism;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 const MAX_DATAGRAMS : usize = 128;
 const USER_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
-const USER_TIMEOUT_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+//const USER_TIMEOUT_DURATION: tokio::time::Duration = tokio::time::Duration::from_secs(120);
+const USER_TIMEOUT_DURATION: u64 = 120;
 
 const BUFFER_POOL_SIZE: usize = 4096;
 const BUFFER_POOL_BUFFER_SIZE: usize = 2048;
 
-const TUN_WRITE_MAX_BATCH_SIZE: usize = 32;
+//const TUN_WRITE_MAX_BATCH_SIZE: usize = 32;
 
 const BATCH_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_micros(500);
 
@@ -92,7 +94,7 @@ pub struct Server {
     tun_device: Arc<AsyncDevice>,
     credentials: HashMap<String, String>,
     udpsocket_fd: AsyncFd<CustomUdpSocket>,
-    bufferpool: Arc<BytesPool>,
+    bufferpool: BytesPool,
     available_ip_addresses: ArrayQueue<Ipv4Addr>,
     pub_to_priv_ip: DashMap<SocketAddr, Ipv4Addr>,
     priv_ip_to_client: DashMap<Ipv4Addr, VPNClient>,
@@ -161,7 +163,7 @@ impl Server {
             tun_netmask: tun_netmask_addr,
             tun_device: tun_interface,
             udpsocket_fd: async_udp_socket_fd,
-            bufferpool: Arc::new(BytesPool::new(BUFFER_POOL_SIZE, BUFFER_POOL_BUFFER_SIZE)),
+            bufferpool: BytesPool::new(BUFFER_POOL_SIZE, BUFFER_POOL_BUFFER_SIZE),
             available_ip_addresses,
             pub_to_priv_ip: DashMap::new(),
             priv_ip_to_client: DashMap::new()
@@ -171,24 +173,16 @@ impl Server {
 
     
     //TODO 
-    fn sock_write_batch(
-        self: &Arc<Self>,
+   fn sock_write_batch(
+        fd: &AsyncFd<CustomUdpSocket>,
         batch: &[(EncryptedPacket, SocketAddr)]
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, std::io::Error> {
 
         let mut msghdrs = [unsafe { std::mem::zeroed::<mmsghdr>() }; MAX_DATAGRAMS];
         let mut iovs = [unsafe { std::mem::zeroed::<iovec>() }; MAX_DATAGRAMS];
         let mut addrs = [unsafe { std::mem::zeroed::<sockaddr_storage>() }; MAX_DATAGRAMS];
         let mut addr_lens = [0u32; MAX_DATAGRAMS];
         
-        // let msghdrs_ptr = msghdrs.as_mut_ptr() as *mut mmsghdr;
-        // let iovs_ptr = iovs.as_mut_ptr() as *mut iovec;
-        // let addrs_ptr = addrs.as_mut_ptr() as *mut sockaddr_storage;
-
-        // let mut msghdrs: [mmsghdr; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        // let mut iovs: [iovec; MAX_DATAGRAMS] = unsafe { std::mem::zeroed() };
-        //let mut addr_lens: [socklen_t; MAX_DATAGRAMS] = [std::mem::size_of::<sockaddr_in>() as socklen_t; MAX_DATAGRAMS];
-
         for (i, (encrypted_handle, sockaddr)) in batch.iter().enumerate() {
             iovs[i] = iovec {
                 iov_base: encrypted_handle.data().as_ptr() as *mut libc::c_void,
@@ -201,7 +195,7 @@ impl Server {
                         sin_family: libc::AF_INET as u16,
                         sin_port: addr_v4.port().to_be(),
                         sin_addr: libc::in_addr {
-                            s_addr: u32::from_be_bytes(addr_v4.ip().octets()),
+                            s_addr: addr_v4.ip().to_bits().to_be(),
                         },
                         sin_zero: [0; 8],
                     };
@@ -250,42 +244,90 @@ impl Server {
 
         }
 
-        //let mut msghdrs_init = unsafe { msghdrs.assume_init() };
-
         let result = unsafe { 
             libc::sendmmsg(
-                self.udpsocket_fd.as_raw_fd(), 
-                msghdrs.as_mut_ptr(), 
-                batch.len() as u32, 
-                libc::MSG_DONTWAIT) 
+            fd.as_raw_fd(), 
+            msghdrs.as_mut_ptr(), 
+            batch.len() as u32, 
+            libc::MSG_DONTWAIT) 
         };
-
-        if result as usize == batch.len() {
-            Ok(())
-        } else if result < 0 {
-            Err(std::io::Error::last_os_error().into())
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            Err(err)
         } else {
-            // Частичная отправка
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Partial send: {}/{} packets", result, batch.len())
-            ).into())
+            Ok(result as usize)
         }
     }
 
+    async fn sock_send_batch_full(
+        self: &Arc<Self>,
+        batch: &[(EncryptedPacket, SocketAddr)]
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let total = batch.len();
+        let mut sent = 0;
+
+        while sent < total {
+            let remaining = &batch[sent..];
+            //let current_batch_len = remaining.len();
+            let mut guard = self.udpsocket_fd.writable().await?;
+
+            match guard.try_io(|inner_fd| {
+                let result = Self::sock_write_batch(inner_fd, &remaining);
+                result
+            }) {
+                Ok(result) => {
+                    match result {
+                        Ok(sent_count) => {
+                            sent += sent_count;
+                        },
+                        Err(err) => {
+                            match err.kind() {
+                                std::io::ErrorKind::WouldBlock => {
+                                    continue;
+                                }
+                                std::io::ErrorKind::Interrupted => {
+                                    continue;
+                                },
+                                _ => return Err(err.into())
+                            }
+                        },
+                    }
+                },
+                Err(_would_block) => {
+                    continue;
+                },
+            }
+            //if let Ok(count) = result
+            //let result = self.sock_write_batch(&remaining);
+            // match result {
+            //     Ok(sent_count) => {
+            //         sent += sent_count;
+            //     },
+            //     Err(err) => {
+            //         match err.kind() {
+            //             std::io::ErrorKind::WouldBlock => {
+            //                 let _guard = self.udpsocket_fd.writable().await?;
+            //                 continue;
+            //             }
+            //             std::io::ErrorKind::Interrupted => {
+            //                 continue;
+            //             },
+            //             _ => return Err(err.into())
+            //         }
+            //     },
+            // }
+        }
+
+        Ok(sent)
+    }
+
+    
     async fn sock_write(
         self: &Arc<Self>,
         data: &[u8],
         dst_addr: &SocketAddr
     )  -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     {
-        // while let Some((msg, addr)) = consumer.recv().await {
-        //     let bytes = bincode::encode_to_vec(msg, bincode::config::standard())?;
-        //     write.send_to(&bytes, addr).await?;
-        // }
-        // Ok(())
-        //let guard = self.udpsocket_fd.writable().await?;
-
         self.udpsocket_fd.get_ref().send_to(&data, *dst_addr)?;
         Ok(())
     }
@@ -296,18 +338,11 @@ impl Server {
         to_encryption_tx: Sender<DecryptedPacket>
     )
     {
-        // let mut original_buffer = vec![0; VIRTIO_NET_HDR_LEN + 65535];
-        // let mut bufs = vec![vec![0u8; 1500]; IDEAL_BATCH_SIZE];
-        // let mut sizes = vec![0; IDEAL_BATCH_SIZE];
 
         let mut original_buffer = [0u8; 65535 + 10];
-        // Используем буферы из пула
         let mut decrypted_buffer_handles: Vec<DecryptedPacket> = Vec::with_capacity(IDEAL_BATCH_SIZE);
-        //let mut bufs: Vec<&mut [u8]> = Vec::with_capacity(32);
         let mut sizes = vec![0; IDEAL_BATCH_SIZE];
-        
-        // Заранее выделяем буферы из пула
-        
+         
         println!("tun_read_task started");
         loop {
             decrypted_buffer_handles.clear();
@@ -362,8 +397,6 @@ impl Server {
     ) {
 
         let mut send_batch = Vec::with_capacity(IDEAL_BATCH_SIZE);
-        //let mut bufs: Vec<&mut BytesMut> = Vec::with_capacity(MAX_DATAGRAMS);
-        let mut packet_count = 0;
 
         println!("encryption worker started");
         loop {
@@ -372,38 +405,25 @@ impl Server {
                 item = to_encrypt_rx.recv_async() => {
                     match item {
                         Ok(decrypted_handle) => {
-                            let start = tokio::time::Instant::now();
-
                             if let Some((_, destination)) = get_packet_info(&decrypted_handle.data()[ENCRYPTED_PACKET_HEADER_SIZE..]) {
                                 if let Some(client) = self.priv_ip_to_client.get(&destination) {
                                     match decrypted_handle.encrypt(&client.cipher) {
                                         Ok(enc) => {
                                             send_batch.push((enc, client.public_ip));
-                                            packet_count += 1;
                                         },
                                         Err(e) => {
                                             eprintln!("Encrypt failed: {}", e);
                                             continue;
                                         },
                                     };
-                                    let encrypt_time = start.elapsed();
-                                    if encrypt_time > tokio::time::Duration::from_millis(1) {
-                                        eprintln!("Slow encryption: {:?}", encrypt_time);
-                                    }
 
-   
-                                    if packet_count >= MAX_DATAGRAMS {
-                                        if let Err(e) = self.sock_write_batch(
-                                            &mut send_batch[..packet_count]
-                                        ) {
+                                    if send_batch.len() >= MAX_DATAGRAMS {
+                                        if let Err(e) = self.sock_send_batch_full(&mut send_batch).await {
                                             eprintln!("Failed to send batch to sock: {}", e);
                                             break;
                                         }
-
-                                        packet_count = 0;
                                         send_batch.clear();
                                     }
-                                    //self.sock_write(PacketType::EncryptedPkt(encrypted_pkt), client.public_ip).await?;
                                 } else {
                                     eprintln!("Failed to get client by destination address {}", destination);
                                     continue;
@@ -421,26 +441,11 @@ impl Server {
                 }
                 // Таймаут для отправки частичного батча
                 _ = tokio::time::sleep(BATCH_TIMEOUT) => {
-                    if packet_count > 0 {
-
-                        
-                        for (buf, addr) in send_batch[..packet_count].iter() {
-                            if let Err(e) = self.sock_write(buf.data(), addr ).await {
-                                eprintln!("Failed to send batch to sock: {}", e);
-                                break;
-                            }
-                        }
-
-                        if let Err(e) = self.sock_write_batch(
-                            &mut send_batch[..packet_count]
-                        ) {
+                    if send_batch.len() > 0 {
+                        if let Err(e) = self.sock_send_batch_full(&mut send_batch).await {
                             eprintln!("Failed to send batch to sock: {}", e);
                             break;
                         }
-                        // for buf in &mut tun_send_bufs[0..packet_count] {
-                        //     buf.clear();
-                        // }
-                        packet_count = 0;
                         send_batch.clear();
                     }
                 }
@@ -551,14 +556,15 @@ impl Server {
                 }
             };
 
-            let vpnclient = VPNClient {
-                client_nonce: client_nonce,
-                server_nonce: server_nonce,
-                public_ip: src_addr,
-                authorized: false,
-                cipher,
-                lastseen: Instant::now(),
-            };
+            let vpnclient = VPNClient::new(client_nonce, server_nonce, src_addr, cipher);
+            // let vpnclient = VPNClient {
+            //     client_nonce: client_nonce,
+            //     server_nonce: server_nonce,
+            //     public_ip: src_addr,
+            //     authorized: false,
+            //     cipher,
+            //     lastseen: Instant::now(),
+            // };
 
             //4. Send client handshake responce
             if let Err(e) = self.sock_write(&handshake_resp_handle.data(), &src_addr).await {
@@ -581,7 +587,10 @@ impl Server {
                 async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)).await;
                     
-                    if let Some(_) = self_clone.priv_ip_to_client.get(&assigned_ip).filter(|v| v.authorized == false) {
+                    if let Some(_) = self_clone.priv_ip_to_client.get(&assigned_ip).filter(|v| {
+                        let authorized = v.authorized.load(std::sync::atomic::Ordering::Relaxed);
+                        authorized == false
+                    }) {
                         self_clone.priv_ip_to_client.remove(&assigned_ip);
                         self_clone.pub_to_priv_ip.remove(&pub_ip);
                         self_clone.available_ip_addresses.push(assigned_ip).unwrap();
@@ -608,7 +617,7 @@ impl Server {
             }
             let private_ip = private_ip_opt.unwrap();
 
-            let client_opt = self.priv_ip_to_client.get_mut(&private_ip);
+            let client_opt = self.priv_ip_to_client.get(&private_ip);
             if let None = client_opt {
                 self.pub_to_priv_ip.remove(&src_addr);
                 eprintln!("Public ip {} is presend, but client does not exist", src_addr);
@@ -648,8 +657,8 @@ impl Server {
                         eprintln!("Failed to send tunnel settings to client: {}", src_addr);
                         break;
                     }
-                    client.authorized = true;
-                    client.lastseen = Instant::now();
+                    client.set_authorized(true);
+                    client.update_lastseen();
 
                 },
                 Err(e) => {
@@ -664,7 +673,7 @@ impl Server {
     }
 
 
-    fn get_client_by_public_ip(self: &Arc<Self>, public_ip: &SocketAddr) -> Option<dashmap::mapref::one::RefMut<'_, Ipv4Addr, VPNClient>> {
+    fn get_client_by_public_ip(self: &Arc<Self>, public_ip: &SocketAddr) -> Option<dashmap::mapref::one::Ref<'_, Ipv4Addr, VPNClient>> {
         let pub_to_priv_opt = self.pub_to_priv_ip.get(public_ip);
         if let None = pub_to_priv_opt {
             eprintln!("Client {} is not in active users", public_ip);
@@ -672,7 +681,7 @@ impl Server {
         }
         let pub_to_priv = pub_to_priv_opt.unwrap();
 
-        let client_opt = self.priv_ip_to_client.get_mut(&pub_to_priv);
+        let client_opt = self.priv_ip_to_client.get(&pub_to_priv);
         if let None = client_opt {
             eprintln!("Client {} private address is not assigned", public_ip);
             return None;
@@ -687,9 +696,15 @@ impl Server {
         loop {
             interval.tick().await;
 
-            let now = Instant::now();
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            //let now = Instant::now();
             self.priv_ip_to_client.retain(|_priv_ip, client| {
-                if now - client.lastseen > USER_TIMEOUT_DURATION {
+                let last_secs = client.lastseen.load(std::sync::atomic::Ordering::Relaxed);
+                if now_secs.saturating_sub(last_secs) > USER_TIMEOUT_DURATION {
                     self.pub_to_priv_ip.remove(&client.public_ip);
                     println!("User {} disconnected", client.public_ip);
                     false
@@ -868,7 +883,7 @@ impl Server {
         to_decrypt_rx: Receiver<(EncryptedPacket, SocketAddr)>
     ) {
         let mut gro_table = GROTable::default();
-        let mut tun_send_bufs = Vec::<DecryptedPacket>::with_capacity(TUN_WRITE_MAX_BATCH_SIZE);
+        let mut tun_send_bufs = Vec::<DecryptedPacket>::with_capacity(IDEAL_BATCH_SIZE);
         let mut packet_count = 0;
 
         //let (tx, mut rx_decrypted) = mpsc::channel::<(BufferHandle, SocketAddr)>(32);
@@ -879,8 +894,6 @@ impl Server {
                 item = to_decrypt_rx.recv_async() => {
                     match item {
                         Ok((encrypted_handle, src_addr)) => {
-                            let start = tokio::time::Instant::now();
-
                             let mut client = match self.get_client_by_public_ip(&src_addr) {
                                 Some(client) => {
                                     client
@@ -890,11 +903,11 @@ impl Server {
                                 }
                             };
                             
-                            let decrypted_handle = match client.authorized {
+                            let decrypted_handle = match client.authorized.load(std::sync::atomic::Ordering::Relaxed) {
                                 true => {
                                     match encrypted_handle.decrypt(&client.cipher) {
                                         Ok(dec) => {
-                                            client.lastseen = Instant::now();
+                                            client.update_lastseen();
                                             dec
                                         },
                                         Err(e) => {
@@ -908,29 +921,24 @@ impl Server {
                                     continue;
                                 },
                             };
-                          
-                            let encrypt_time = start.elapsed();
-                                if encrypt_time > tokio::time::Duration::from_millis(1) {
-                                    eprintln!("Slow encryption: {:?}", encrypt_time);
+                            
+                            tun_send_bufs.push(decrypted_handle);
+                            packet_count += 1;
+
+
+                            if packet_count >= IDEAL_BATCH_SIZE {
+                                if let Err(e) = self.tun_device.send_multiple(
+                                    &mut gro_table, 
+                                    &mut tun_send_bufs[0..packet_count], 
+                                    ENCRYPTED_PACKET_HEADER_SIZE
+                                ).await {
+                                    eprintln!("Failed to send batch to tun: {}", e);
                                 }
                                 
-                                tun_send_bufs.push(decrypted_handle);
-                                packet_count += 1;
-
-
-                                if packet_count >= TUN_WRITE_MAX_BATCH_SIZE {
-                                    if let Err(e) = self.tun_device.send_multiple(
-                                        &mut gro_table, 
-                                        &mut tun_send_bufs[0..packet_count], 
-                                        ENCRYPTED_PACKET_HEADER_SIZE
-                                    ).await {
-                                        eprintln!("Failed to send batch to tun: {}", e);
-                                    }
-                                    
-                                    tun_send_bufs.clear();
-                                    packet_count = 0;
-                                }
-                            },
+                                tun_send_bufs.clear();
+                                packet_count = 0;
+                            }
+                        },
                         Err(_) => {
                             break;
                         },

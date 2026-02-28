@@ -1,0 +1,78 @@
+version: '3.8'
+
+
+networks:
+  vpn_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 20.0.0.0/24
+  external_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+
+
+services:
+  vpn-server:
+    container_name: "vpn-server"
+    build: .
+    # container_name: rust-vpn
+    image: rust-vpn:latest
+    # Вместо privileged: true можно выдать только необходимые возможности
+    cap_add:
+      - NET_ADMIN          # управление сетью (создание TUN, настройка маршрутов)
+      - NET_RAW            # сырые сокеты (могут понадобиться для некоторых VPN)
+      - SYS_MODULE         # если нужно загружать модули ядра (обычно не требуется)
+    devices:
+      - /dev/net/tun:/dev/net/tun   # проброс TUN-устройства
+    
+    networks:
+      - vpn_net
+      - external_net
+
+    sysctls:
+      - net.ipv4.ip_forward=1
+    #volumes:
+    #  - ./config:/etc/vpn-server     # монтирование конфигурации (опционально)
+    ports:
+      - "8080:8080/udp"            # порт, который слушает VPN (замените на свой)
+    # environment:
+    #   - RUST_LOG=info                 # уровень логирования (если используется env_logger)
+    command: ["listen", "/app/users.txt", "/app/server.priv", "8080", "10.0.0.1", "255.255.255.0"]
+    restart: unless-stopped
+  
+  
+  vpn-client:
+    container_name: "vpn-client"
+    image: vpn-client:latest
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - vpn-server
+    environment:
+      - LD_LIBRARY_PATH=/app
+    networks:
+      - vpn_net
+    # Используем те же файлы, что и сервер (users.txt не нужен клиенту, но может лежать)
+    # Переопределяем команду для подключения к серверу
+    command: ["/app/client", "/app/server.pub", "vpn-server", "8080", "Sucker", "123456"]
+    # Для удобства можно добавить tty и stdin_open, чтобы потом зайти в контейнер
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
+  
+  iperf3-server:
+    image: networkstatic/iperf3
+    container_name: iperf3-server
+    command: -s
+    networks:
+      external_net:
+        ipv4_address: 172.20.0.100
+    restart: unless-stopped
