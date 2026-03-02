@@ -13,11 +13,11 @@ panic = "abort"
 
 [dependencies]
 aead = { version = "0.5.2", features = ["bytes"] }
+rayon = "1.11.0"
 
 crossbeam-queue = "0.3.12"
 
 dashmap = "6.1.0"
-papaya = "0.2.3"
 
 chacha20poly1305 = "0.10.1"
 
@@ -36,5 +36,6 @@ rand = "0.8"
 hex = "0.4.3"
 flume = "0.12.0"
 
+socket2 = "0.6.2"
+
 pprof = { version = "0.15", features = ["flamegraph", "protobuf-codec"] }
-ctrlc = "3.4"   # для обработки Ctrl+C

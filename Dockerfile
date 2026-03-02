@@ -4,14 +4,14 @@ RUN cargo install flamegraph
 RUN echo "kernel.perf_event_paranoid = -1" >>/etc/sysctl.conf
 WORKDIR /app
 COPY . .
-RUN cargo build --release
+RUN cargo build
 
 FROM debian:bookworm-slim
 WORKDIR /app
 RUN apt update && apt install iputils-ping tcpdump -y
 RUN apt-get update && apt-get install -y nftables iproute2 watch conntrack
 # && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/vpn /usr/local/bin/vpn
+COPY --from=builder /app/target/debug/vpn /usr/local/bin/vpn
 COPY users.txt /app
 COPY server.priv /app
 COPY nftables.conf /etc/nftables.conf

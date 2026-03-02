@@ -1,5 +1,6 @@
-use std::{net::SocketAddr};
+//use std::{net::SocketAddr};
 use chacha20poly1305::ChaCha20Poly1305;
+use libc::{sockaddr_storage, socklen_t};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
@@ -7,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 pub struct VPNClient {
     pub client_nonce: u128,
     pub server_nonce: u128,
-    pub public_ip: SocketAddr,
+    pub public_ip: (sockaddr_storage, socklen_t),
     pub authorized: AtomicBool,
     pub cipher: ChaCha20Poly1305,
     pub lastseen: AtomicU64
@@ -16,7 +17,7 @@ pub struct VPNClient {
 
 
 impl VPNClient {
-    pub fn new(client_nonce: u128, server_nonce: u128, public_ip: SocketAddr, cipher: ChaCha20Poly1305) -> Self {
+    pub fn new(client_nonce: u128, server_nonce: u128, public_ip: (sockaddr_storage, socklen_t), cipher: ChaCha20Poly1305) -> Self {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         Self { client_nonce, server_nonce, public_ip, authorized: AtomicBool::new(false), cipher, lastseen: AtomicU64::new(now) }
     }

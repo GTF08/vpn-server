@@ -1,0 +1,38 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug executable 'vpn'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=vpn"
+                ]
+            },
+            "args": [
+                "listen", 
+                "users.txt", 
+                "server.priv",
+                "8080", 
+                "10.0.0.1", 
+                "255.255.255.0"
+            ]
+        },
+        {
+            "name": "Debug unit tests in executable 'vpn'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=vpn"
+                ]
+            }
+        }
+    ]
+}
